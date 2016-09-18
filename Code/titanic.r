@@ -1,8 +1,15 @@
 #Kaggle titanic competition
-library(glmnet)
-library(rpart)
+library(glmnet)       #for cross-validated logistic reg
+library(rpart)        #simple trees
 library(ggplot2)
-library(MASS)
+library(lmtest)       #for resettest Ramsey RESET functional specification test
+library(MASS)         #for rlm - robust regression
+#library(e1071)        #svm, not used, use kernlab for caret tuning
+library(kernlab)      #svm for caret
+library(randomForest)
+library(neuralnet)
+library(mgcv)         #for gam
+library(caret)
 
 train <- read.csv("DataRaw/train.csv")
 test  <- read.csv("DataRaw/test.csv")
@@ -49,15 +56,49 @@ test$ParchGt1  <- as.numeric(test$Parch>0)
 tableParchGt1[2,]/colSums(tableParchGt1) #survival rates per parents/children #
 summary(tableParchGt1)
 
+ggplot(train,aes(x=Age,y=Parch))+geom_point()+geom_smooth()
+ggplot(train,aes(x=Age,y=SibSp))+geom_point()+geom_smooth()
+ggplot(train,aes(x=Age,y=Sex))+geom_point()+geom_smooth()
+summary(train[grep("Mrs",train$Name),"Age"])
+summary(train[grep("Mr",train$Name),"Age"])
+summary(train[grep("Master",train$Name),"Age"])
+summary(train[grep("Miss",train$Name),"Age"])
+
 #age missing data - set to average
 AvgAgeTrain <- mean(train$Age,na.rm=T)
-train[is.na(train$Age),"Age"] <- AvgAgeTrain
-test[is.na(test$Age),"Age"] <- AvgAgeTrain
+# train[is.na(train$Age),"Age"] <- AvgAgeTrain
+# test[is.na(test$Age),"Age"] <- AvgAgeTrain
+
+######   imputation based on bagging in caret      ############
+pp <- preProcess(train[,c("Age","SibSp","Parch")],method=c("bagImpute"))
+t2 <- predict(pp,train[,c("Age","SibSp","Parch")])
+train$Age <- t2$Age
+pp <- preProcess(test[,c("Age","SibSp","Parch")],method=c("bagImpute"))
+t2 <- predict(pp,test[,c("Age","SibSp","Parch")])
+test$Age <- t2$Age
+
+##############  simple imputation based on common sense ######
+# train[((is.na(train$Age))&(train$Parch==0)),"Age"] <- AvgAgeTrain
+# train[((is.na(train$Age))&(train$SibSp>1)),"Age"] <- 5
+# train[is.na(train$Age),"Age"] <- 10
+# test[((is.na(test$Age))&(test$Parch==0)),"Age"] <- AvgAgeTrain
+# test[((is.na(test$Age))&(test$SibSp>1)),"Age"] <- 5
+# test[is.na(test$Age),"Age"] <- 10
 train$LogAge <- log(train$Age)
 test$LogAge  <- log(test$Age)
 
+#Embarked
+(tableEmb <- table(train$Survived,train$Embarked,dnn=c("Survived","Embarked")))
+tableEmb[2,]/colSums(tableEmb) #survival rates per embarcation port
+summary(tableEmb)
 #embarkation missing data - not significant based on linear regression R2
 train[!(train$Embarked %in% c("C","Q","S")),]
+train$EmbC <- as.numeric(train$Embarked=="C")
+train$EmbQ <- as.numeric(train$Embarked=="Q")
+train$EmbS <- as.numeric(train$Embarked=="S")
+test$EmbC <- as.numeric(test$Embarked=="C")
+test$EmbQ <- as.numeric(test$Embarked=="Q")
+test$EmbS <- as.numeric(test$Embarked=="S")
 
 #scatterplot
 pairs(~Survived+Sex+Pclass+Age+SibSp+Embarked+Fare,train)
@@ -74,10 +115,48 @@ for (i in LETTERS) {
   }
 }
 
+train$CabinDigits <- 0
+existdigit <- grep("[0-9]",train$Cabin)
+train$CabinDigits[existdigit] <- 1
+(tableDig <- table(train$Survived,train$CabinDigits,dnn=c("Survived","CabinDigit")))
+tableDig[2,]/colSums(tableDig) #survival rates per embarcation port
+summary(tableDig)
+fdig <- function(x) {
+  x <- strsplit(as.character(x),split=" ") #only first number
+  x <- unlist(x)
+  x <- x[grep("[0-9]",x)[1]]
+  rmdig <- regmatches(x,gregexpr("[[:digit:]]",x))
+  return(as.numeric(paste(unlist(rmdig),collapse="")))
+} 
+train$CabinNum <- 0
+train$CabinNum[train$CabinDigits==1] <- 
+  sapply(train$Cabin[train$CabinDigits==1],fdig)
+test$CabinDigits <- 0
+existdigit <- grep("[0-9]",test$Cabin)
+test$CabinDigits[existdigit] <- 1
+test$CabinNum <- 0
+test$CabinNum[test$CabinDigits==1] <- 
+  sapply(test$Cabin[test$CabinDigits==1],fdig)
+
+
+#for neural network need number value instead of char
+train$Male <- as.numeric(train$Sex=="male")
+test$Male  <- as.numeric(test$Sex=="male")
+
+#clean NAs from Fare
+train$Fare[which(is.na(train$Fare))] <- 0
+test$Fare[which(is.na(test$Fare))] <- 0
+
+train$PC1 <- as.numeric(train$Pclass==1)
+train$PC2 <- as.numeric(train$Pclass==2)
+train$PC3 <- as.numeric(train$Pclass==3)
+test$PC1  <- as.numeric(test$Pclass==1)
+test$PC2  <- as.numeric(test$Pclass==2)
+test$PC3  <- as.numeric(test$Pclass==3)
 
 ##### Modelling #############
 
-caseswitch <- 13 #choose model to create predict.csv file
+caseswitch <- 14 #choose model to create predict.csv file
 
 switch(caseswitch,
        
@@ -113,15 +192,26 @@ switch(caseswitch,
        },
        
        {
-         #5 - Logit with glm - 81% on train
-         logit1 <- glm(data=train,Survived~Age+Sex+Pclass+SibSp,
-                       family=binomial(link="logit"))
+         #5 - Logit with glm - 82% on train, 77% on test - BEST
+         logit1 <- step(glm(data=train,Survived~LogAge+Male+PC1+PC2+CabinD+CabinE+
+                         Sib0+Sib1+EmbS,family=binomial(link="logit")))
          resp.train <- predict(logit1,type="response")
          print(ggplot(data.frame(survive=as.factor(train$Survived),
                            prediction=resp.train),
                 aes(x=prediction,color=survive,linetype=survive))+geom_density())
-         cutoff <- 0.6 #based on density graph
+         cutoff_search <- seq(0.2,0.9,0.01)
+         c <- rep(0,length(cutoff_search))
+         for (i in seq_along(cutoff_search)) {
+           cutoff <- cutoff_search[i]
+           pred.train <- ifelse(resp.train>cutoff,1,0)
+           contingency <- prop.table(table(pred=pred.train,train=train$Survived))
+           c[i] <- sum(diag(contingency))
+         }
+         cutoff <- cutoff_search[which.max(c)]
          pred.train <- ifelse(resp.train>cutoff,1,0)
+         (contingency <- prop.table(table(pred=pred.train,train=train$Survived)))
+         sum(diag(contingency))
+         
          p1 <- ifelse(predict(logit1,newdata=test,type="response")>cutoff,1,0)
          pred.dat <- data.frame(PassengerId=test$PassengerId,Survived=p1)
        },
@@ -178,10 +268,11 @@ switch(caseswitch,
        
        {
          #10 - Simple linear regression with sig Cabin Info and Sibling - 80% on train
-         train10 <- train[,c("CabinD","CabinE","CabinF",
-                             "Sib0","Sib1","ParchGt1")]
-         train10 <- cbind(train10,train[,c("Survived","Age","Sex","Pclass")])
-         lreg10 <- lm(Survived~.,train10)
+         vars <- c("Sex","Pclass","LogAge","CabinD","CabinE","CabinF",
+                   "Sib0","Sib1","ParchGt1","EmbS","CabinDigits","CabinNum")
+         f <- paste(vars,collapse ="+")
+         train10 <- train[,c(vars,"Survived")]
+         lreg10 <- lm(as.formula(paste0("Survived~",f,"+Sex:Pclass+Sex:LogAge")),train10)
          pred.train <- round(predict(lreg10))
          
          #RESET test significant, functional misspecification for simple reg
@@ -195,9 +286,6 @@ switch(caseswitch,
          print(ggplot(data=data.frame(residuals=lreg10$residuals,Fare=train$Fare),
                 aes(x=Fare,y=residuals))+geom_point()+geom_smooth())
          
-         test10 <- test[,c("CabinD","CabinE","CabinF",
-                           "Sib0","Sib1","ParchGt1")]
-         test10 <- cbind(test10,test[,c("Age","Sex","Pclass")])
          p1 <- round(predict(lreg10,newdata=test))
          pred.dat <- data.frame(PassengerId=test$PassengerId,Survived=p1)
        },
@@ -228,20 +316,82 @@ switch(caseswitch,
        
        {
          #13 - Logit with glmnet + cabin info + Sibling - 81% on train
-         x <- data.matrix(train[,c("Sex","Pclass","Age","Sib0","Sib1","ParchGt1",
-                                   "CabinD","CabinE","CabinF")])
+         vars <- c("Sex","Pclass","LogAge","CabinD","CabinE","CabinF",
+                   "Sib0","Sib1","SibGt1","ParchGt1")
+         x <- data.matrix(train[,vars])
          y <- train$Survived
          cvfit2 <- cv.glmnet(x,y,family="binomial",alpha=0) #,type.measure = "class")
          #use 1 standard deviation from minimum lambda for regularization
          pred.train <- predict(cvfit2,newx=x,type="class",s="lambda.1se")
-         x <- data.matrix(test[,c("Sex","Pclass","Age","Sib0","Sib1","ParchGt1",
-                                  "CabinD","CabinE","CabinF")])
+         x <- data.matrix(test[,vars])
          p1 <- as.numeric(predict(cvfit2,newx=x,type="class",s="lambda.1se"))
+         pred.dat <- data.frame(PassengerId=test$PassengerId,Survived=p1)
+       },
+       
+       {
+         #14 - svm - 84% on train, 76% on test
+         objControl <- trainControl(method='repeatedcv',number=5,repeats=10)
+         svm_traingrid <- expand.grid(sigma=seq(0.01,0.07,0.01),C=seq(3,5,0.5))
+         svmfit1 <- train(as.factor(Survived)~LogAge+Male+PC1+PC2+PC3+
+                            CabinD+CabinE+CabinF+CabinNum+EmbC+EmbS+
+                            Sib0+Sib1+SibGt1+ParchGt1+Fare,data=train,
+                          method="svmRadial",trControl=objControl,
+                          tuneGrid=svm_traingrid)
+         print(plot(svmfit1))
+         #svmfit1 <- ksvm(as.factor(Survived)~Sex+Pclass+Age+CabinD+CabinE+CabinF+
+         #              Sib0+Sib1+SibGt1+ParchGt1,data=train,kernel='rbfdot')
+         pred.train <- predict(svmfit1,newdata=train)
+         p1 <- predict(svmfit1,newdata=test)
+         pred.dat <- data.frame(PassengerId=test$PassengerId,Survived=p1)
+       },
+       
+       {
+         #15 - Random forest with sig Cabin Info and Sibling - 82% on train
+         vars <- c("Sex","PC1","PC2","Age","CabinD","CabinE","CabinF","CabinNum",
+                         "Sib0","Sib1","ParchGt1","Fare","EmbC","EmbQ","EmbS")
+         rforest1 <- randomForest(x=train[,vars],y=as.factor(train$Survived),
+                                  importance=T)
+         pred.train <- predict(rforest1,type="class")
+         p1 <- predict(rforest1,newdata=test[,vars],type="class")
+         pred.dat <- data.frame(PassengerId=test$PassengerId,Survived=p1)
+       },
+       
+       {
+         #16 - Neural net with sig Cabin Info and Sibling - 85% on train
+         vars <- c("Pclass","Age","CabinD","CabinE","CabinF",
+                   "Sib0","Sib1","SibGt1","ParchGt1","Male")
+         f <- paste("Survived",paste(vars,collapse ="+"),sep="~")
+         nnfit1 <- neuralnet(f,data=train,hidden=6, linear.output = F)
+         resp.train <- compute(nnfit1,train[,vars])$net.result
+         print(ggplot(data.frame(survive=as.factor(train$Survived),
+                                 prediction=resp.train),
+                      aes(x=prediction,color=survive,linetype=survive))+geom_density())
+         cutoff <- 0.5 #based on density graph
+         pred.train <- ifelse(resp.train>cutoff,1,0)
+         p1 <- ifelse(compute(nnfit1,test[,vars])$net.result>cutoff,1,0)
+         pred.dat <- data.frame(PassengerId=test$PassengerId,Survived=p1)
+         
+         #debug
+         print(nnfit1)
+         plot(nnfit1)
+       },
+       
+       {
+         #17 - GAM - 82% on train
+         vars <- c("Male","PC1","PC2","s(LogAge)","CabinD","CabinE","CabinF",
+                   "Sib0","Sib1","ParchGt1","s(Fare)","s(CabinNum)",
+                   "Male:PC1","Male:LogAge","EmbS")
+         f <- paste("Survived",paste(vars,collapse ="+"),sep="~")
+         gamfit1 <- gam(as.formula(f),data=train,family=binomial(link="logit"))
+         pred.train <- round(predict(gamfit1,type="response"))
+         p1 <- round(predict(gamfit1,newdata=test,type="response"))
          pred.dat <- data.frame(PassengerId=test$PassengerId,Survived=p1)
        }
        
 )
 
+
+### Statistics and write prediction file ####
 
 (contingency <- prop.table(table(pred=pred.train,train=train$Survived)))
 sum(diag(contingency))
