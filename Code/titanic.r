@@ -59,10 +59,30 @@ summary(tableParchGt1)
 ggplot(train,aes(x=Age,y=Parch))+geom_point()+geom_smooth()
 ggplot(train,aes(x=Age,y=SibSp))+geom_point()+geom_smooth()
 ggplot(train,aes(x=Age,y=Sex))+geom_point()+geom_smooth()
-summary(train[grep("Mrs",train$Name),"Age"])
-summary(train[grep("Mr",train$Name),"Age"])
+summary(train[grep("Mrs\\.",train$Name),"Age"])
+summary(train[grep("Mr\\.",train$Name),"Age"])
 summary(train[grep("Master",train$Name),"Age"])
 summary(train[grep("Miss",train$Name),"Age"])
+train$Mr <- 0
+train[grep("Mr\\.",train$Name),"Mr"] <- 1
+train$Mrs <- 0
+train[grep("Mrs\\.",train$Name),"Mrs"] <- 1
+train$Master <- 0
+train[grep("Master",train$Name),"Master"] <- 1
+train$Miss <- 0
+train[grep("Miss",train$Name),"Miss"] <- 1
+train$OtherName <- 0
+train[!(train$Mr+train$Mrs+train$Master+train$Miss),"OtherName"] <- 1
+test$Mr <- 0
+test[grep("Mr\\.",test$Name),"Mr"] <- 1
+test$Mrs <- 0
+test[grep("Mrs\\.",test$Name),"Mrs"] <- 1
+test$Master <- 0
+test[grep("Master",test$Name),"Master"] <- 1
+test$Miss <- 0
+test[grep("Miss",test$Name),"Miss"] <- 1
+test$OtherName <- 0
+test[!(test$Mr+test$Mrs+test$Master+test$Miss),"OtherName"] <- 1
 
 #age missing data - set to average
 AvgAgeTrain <- mean(train$Age,na.rm=T)
@@ -70,11 +90,13 @@ AvgAgeTrain <- mean(train$Age,na.rm=T)
 # test[is.na(test$Age),"Age"] <- AvgAgeTrain
 
 ######   imputation based on bagging in caret      ############
-pp <- preProcess(train[,c("Age","SibSp","Parch")],method=c("bagImpute"))
-t2 <- predict(pp,train[,c("Age","SibSp","Parch")])
+pp <- preProcess(train[,c("Age","SibSp","Parch","Mr","Miss","Mrs","Master","OtherName")],
+                 method=c("bagImpute"))
+t2 <- predict(pp,train[,c("Age","SibSp","Parch","Mr","Miss","Mrs","Master","OtherName")])
 train$Age <- t2$Age
-pp <- preProcess(test[,c("Age","SibSp","Parch")],method=c("bagImpute"))
-t2 <- predict(pp,test[,c("Age","SibSp","Parch")])
+pp <- preProcess(test[,c("Age","SibSp","Parch","Mr","Miss","Mrs","Master","OtherName")],
+                 method=c("bagImpute"))
+t2 <- predict(pp,test[,c("Age","SibSp","Parch","Mr","Miss","Mrs","Master","OtherName")])
 test$Age <- t2$Age
 
 ##############  simple imputation based on common sense ######
@@ -192,9 +214,10 @@ switch(caseswitch,
        },
        
        {
-         #5 - Logit with glm - 82% on train, 77% on test - BEST
+         #5 - Logit with glm - 84% on train, 77% on test
          logit1 <- step(glm(data=train,Survived~LogAge+Male+PC1+PC2+CabinD+CabinE+
-                         Sib0+Sib1+EmbS,family=binomial(link="logit")))
+                         Sib0+Sib1+EmbS+Master+Miss+ParchGt1,
+                         family=binomial(link="logit")))
          resp.train <- predict(logit1,type="response")
          print(ggplot(data.frame(survive=as.factor(train$Survived),
                            prediction=resp.train),
@@ -329,12 +352,13 @@ switch(caseswitch,
        },
        
        {
-         #14 - svm - 84% on train, 76% on test
+         #14 - svm - 87% on train, 77% on test
          objControl <- trainControl(method='repeatedcv',number=5,repeats=10)
          svm_traingrid <- expand.grid(sigma=seq(0.01,0.07,0.01),C=seq(3,5,0.5))
-         svmfit1 <- train(as.factor(Survived)~LogAge+Male+PC1+PC2+PC3+
+         svmfit1 <- train(as.factor(Survived)~LogAge+Male+PC1+PC2+
                             CabinD+CabinE+CabinF+CabinNum+EmbC+EmbS+
-                            Sib0+Sib1+SibGt1+ParchGt1+Fare,data=train,
+                            Sib0+SibGt1+ParchGt1+Fare+Master+Miss,
+                          data=train,
                           method="svmRadial",trControl=objControl,
                           tuneGrid=svm_traingrid)
          print(plot(svmfit1))
@@ -346,9 +370,10 @@ switch(caseswitch,
        },
        
        {
-         #15 - Random forest with sig Cabin Info and Sibling - 82% on train
-         vars <- c("Sex","PC1","PC2","Age","CabinD","CabinE","CabinF","CabinNum",
-                         "Sib0","Sib1","ParchGt1","Fare","EmbC","EmbQ","EmbS")
+         #15 - Random forest - 83% on train, 78% on train, BEST
+         vars <- c("Sex","Pclass","Age","CabinD","CabinE","CabinF","CabinNum",
+                   "SibSp","Parch","Fare","OtherName",
+                   "EmbC","EmbQ","EmbS","Mr","Mrs","Master","Miss")
          rforest1 <- randomForest(x=train[,vars],y=as.factor(train$Survived),
                                   importance=T)
          pred.train <- predict(rforest1,type="class")
